@@ -1,0 +1,13 @@
+Work plan (ongoing)
+====================
+
+1) Formation templates for 4-3-3 variants (CDM, CAM) – DONE
+   - Added src/formations.py with role slots and hints.
+
+Next steps to tackle:
+2) Define constraint schema + baseline optimizer loop (greedy/local search) using these formations. – DONE
+   - Added src/team_optimizer.py with TeamConstraints, greedy selector, and role-weighted scoring.
+3) Playstyle-aware role fit scoring tied to slots.
+4) Team Competitiveness Index (positional fit, synergy, depth).
+5) Upgrade optimizer (GA/CP-SAT) once scoring pieces are ready.
+6) Agent integration and output formatting for teams/TCI.

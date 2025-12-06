@@ -28,23 +28,24 @@ You MUST use these tools whenever the user asks for:
 TOOLS you can call:
 
 1) search_player
-   - Description: search for players in the database by name
-     (handles typos like "Leonel Messi").
+    - Description: search for players in the database by name
+      (handles typos like "Leonel Messi").
    - Args (JSON): {"query": "<player name string>"}
    - The tool returns JSON like:
        {"players": [
-           {
-             "short_name": "...",
-             "long_name": "...",
-             "age": ...,
-             "club_name": "...",
-             "nationality_name": "...",
-             "value_eur": ...,
-             "overall": ...,
-             "position_10": "ST"
-           },
-           ...
-       ]}
+            {
+              "short_name": "...",
+              "long_name": "...",
+              "age": ...,
+              "club_name": "...",
+              "nationality_name": "...",
+              "value_eur": ...,
+              "overall": ...,
+              "position_10": "ST",
+              "playstyle": "Pace Winger"
+            },
+            ...
+        ]}
 
 2) predict_player
    - Description: run ML models for a specific player chosen from search_player.
@@ -62,7 +63,8 @@ TOOLS you can call:
            "shooting": ...,
            "dribbling": ...,
            "defending": ...,
-           "physic": ...
+            "physic": ...,
+            "playstyle": "...",
          },
          "actual": {
            "value_eur": ...,
@@ -120,7 +122,8 @@ When comparing players or answering "why is X more valuable than Y?" you MUST:
   - age and remaining years at top level,
   - potential,
   - role (position_10),
-  - key stats (e.g., pace + finishing for strikers).
+  - key stats (e.g., pace + finishing for strikers),
+  - playstyle fit (e.g., pressing winger vs target forward) when relevant.
 Do NOT just restate the predicted values. Always give at least one concrete football reason based on the stats.
 
 IMPORTANT RULES:
@@ -203,12 +206,15 @@ def offline_fallback(user_query: str, error: Exception) -> str:
         [f"{item['position']} ({item['prob']*100:.0f}%)" for item in top3]
     ) or "n/a"
 
+    playstyle = player.get("playstyle") or "Unspecified"
+
     return (
         "LLM is unreachable right now (likely network blocked). "
         "Showing offline results from local models.\n"
         f"Player: {player['long_name']} ({player['short_name']}), "
         f"age {player['age']}, club {player.get('club_name', '') or 'N/A'}, "
-        f"nation {player.get('nationality_name', '') or 'N/A'}.\n"
+        f"nation {player.get('nationality_name', '') or 'N/A'}, "
+        f"playstyle {playstyle}.\n"
         f"Actual dataset: value {_fmt_value(actual['value_eur'])}, "
         f"overall {actual['overall']}, position {actual['position_10']}.\n"
         f"Predicted: value {_fmt_value(preds['value']['value_pred'])}, "
@@ -255,6 +261,7 @@ def run_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             "value_eur",
             "overall",
             "position_10",
+            "playstyle",
         ]
         cols = [c for c in cols if c in df.columns]
 

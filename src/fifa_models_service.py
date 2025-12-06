@@ -20,7 +20,9 @@ from Feature_Engineering.data_prep import (
     TARGET_POSITION,
 )
 
-DATA_PATH = Path("./data/fifa23_clean.csv")
+# Prefer enriched dataset with playstyle; fall back to the original if missing.
+DATA_PATH = Path("./data/fifa23_with_playstyle.csv")
+FALLBACK_DATA_PATH = Path("./data/fifa23_clean.csv")
 MODELS_DIR = Path("./models")
 
 # ------------ Load data & models once ------------ #
@@ -52,7 +54,11 @@ def _assert_not_lfs_pointer(path: Path) -> None:
 def _load_df() -> pd.DataFrame:
     global _df
     if _df is None:
-        _df = pd.read_csv(DATA_PATH, low_memory=False)
+        path = DATA_PATH if DATA_PATH.exists() else FALLBACK_DATA_PATH
+        _df = pd.read_csv(path, low_memory=False)
+        # Ensure a playstyle column exists, even if fallback was used.
+        if "playstyle" not in _df.columns:
+            _df["playstyle"] = "Unspecified"
     return _df
 
 
@@ -253,6 +259,7 @@ def predict_all_for_player(short_name: str) -> Dict:
             "dribbling": float(row["dribbling"]),
             "defending": float(row["defending"]),
             "physic": float(row["physic"]),
+            "playstyle": str(row.get("playstyle", "")),
         },
         "actual": {
             "value_eur": value_actual,
