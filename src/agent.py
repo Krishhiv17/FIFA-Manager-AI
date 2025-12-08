@@ -14,6 +14,15 @@ from src.fifa_models_service import (
     find_players_by_name,
     predict_all_for_player,
 )
+from src.team_optimizer import (
+    load_player_pool,
+    TeamConstraints,
+    get_formation,
+    greedy_select_team,
+    ga_select_team,
+    compute_tci,
+)
+from src.transfer_suggester import suggest_transfers
 
 SYSTEM_PROMPT = """
 You are a football data analysis assistant for FIFA 23 players.
@@ -28,24 +37,24 @@ You MUST use these tools whenever the user asks for:
 TOOLS you can call:
 
 1) search_player
-    - Description: search for players in the database by name
-      (handles typos like "Leonel Messi").
+   - Description: search for players in the database by name
+     (handles typos like "Leonel Messi").
    - Args (JSON): {"query": "<player name string>"}
    - The tool returns JSON like:
        {"players": [
             {
               "short_name": "...",
-              "long_name": "...",
-              "age": ...,
-              "club_name": "...",
-              "nationality_name": "...",
-              "value_eur": ...,
-              "overall": ...,
-              "position_10": "ST",
-              "playstyle": "Pace Winger"
-            },
-            ...
-        ]}
+           "long_name": "...",
+           "age": ...,
+           "club_name": "...",
+           "nationality_name": "...",
+           "value_eur": ...,
+           "overall": ...,
+           "position_10": "ST",
+            "playstyle": "Pace Winger"
+          },
+          ...
+      ]}
 
 2) predict_player
    - Description: run ML models for a specific player chosen from search_player.
@@ -89,6 +98,45 @@ TOOLS you can call:
            }
          }
        }
+
+3) build_team
+   - Description: build a team for a given formation/style/budget using local optimizer (greedy or genetic), returning XI, bench, and TCI.
+   - Args (JSON): {
+       "formation": "433_cdm"|"433_cam",
+       "style": "balanced"|"counter"|"high_press"|"possession",
+       "mode": "genetic"|"greedy",
+       "budget_eur": <number|null>,
+       "max_age": <number|null>,
+       "min_overall": <number|null>,
+       "min_pace": <number|null>,
+       "min_physic": <number|null>,
+       "bench_size": <int|null>,
+       "prefer_playstyles": [ ... ],
+       "mandatory": [<short_name>],
+       "blocked": [<short_name>]
+     }
+   - Returns JSON with team list, bench, TCI breakdown, and summary (avg overall, total value).
+
+4) suggest_transfers
+   - Description: given a current team (list of players with position_10), suggest upgrades aligned with a style/formation.
+   - Args (JSON): {
+       "current_team": [
+         {"short_name": "...", "position_10": "ST", "playstyle": "...", "overall": 85, "value_eur": 50000000},
+         ...
+       ],
+       "formation": "433_cdm"|"433_cam",
+       "style": "balanced"|"counter"|"high_press"|"possession",
+       "budget_eur": <number|null>,
+       "max_age": <number|null>,
+       "min_overall": <number|null>,
+       "min_pace": <number|null>,
+       "min_physic": <number|null>,
+       "bench_size": <int|null>,
+       "prefer_playstyles": [ ... ],
+       "mandatory": [<short_name>],
+       "blocked": [<short_name>]
+     }
+   - Returns JSON with suggested transfers per slot (candidate, score gain, role).
 
 TOOL CALL FORMAT (IMPORTANT):
 
@@ -136,6 +184,7 @@ IMPORTANT RULES:
   2) Then call TOOL: predict_player using the short_name returned by search_player.
   3) ONLY AFTER you have TOOL_RESULT for all required players, produce FINAL_ANSWER.
 - You MUST NOT answer such questions directly from your own knowledge without calling tools at least once for this query.
+- For team building or transfer suggestions, you MUST call the appropriate tool (build_team or suggest_transfers) before answering.
 
 - FINAL_ANSWER must be a clean explanation for the user, in natural language, with NO TOOL: or TOOL_RESULT: text shown.
 
@@ -245,6 +294,25 @@ def extract_final_answer(text: str) -> str:
     return ""
 
 
+def _to_builtin(obj):
+    """Convert numpy/pandas scalars to plain Python for JSON serialization."""
+    try:
+        import numpy as np  # type: ignore
+        if isinstance(obj, np.generic):
+            return obj.item()
+    except Exception:
+        pass
+    return obj
+
+
+def _clean_struct(x):
+    if isinstance(x, dict):
+        return {k: _clean_struct(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_clean_struct(v) for v in x]
+    return _to_builtin(x)
+
+
 def run_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if tool_name == "search_player":
         query = args.get("query", "")
@@ -266,13 +334,60 @@ def run_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         cols = [c for c in cols if c in df.columns]
 
         players = df[cols].to_dict(orient="records")
-        return {"players": players}
+        return _clean_struct({"players": players})
 
     elif tool_name == "predict_player":
         short_name = args.get("short_name")
         if not short_name:
             raise ValueError("predict_player requires 'short_name'.")
-        return predict_all_for_player(short_name)
+        return _clean_struct(predict_all_for_player(short_name))
+
+    elif tool_name == "build_team":
+        pool = load_player_pool()
+        constraints = TeamConstraints(
+            formation_code=args.get("formation", "433_cdm"),
+            style=args.get("style", "balanced"),
+            budget_eur=args.get("budget_eur"),
+            gk_reserve_pct=args.get("gk_reserve_pct", 0.1),
+            max_age=args.get("max_age"),
+            min_pace=args.get("min_pace"),
+            min_physic=args.get("min_physic"),
+            min_stamina=args.get("min_stamina"),
+            min_passing=args.get("min_passing"),
+            min_overall=args.get("min_overall"),
+            prefer_playstyles=args.get("prefer_playstyles", []) or [],
+            mandatory_players=args.get("mandatory", []) or [],
+            blocked_players=args.get("blocked", []) or [],
+            bench_size=args.get("bench_size", 3) or 3,
+        )
+        formation = get_formation(constraints.formation_code)
+        # Genetic only
+        team, summary = ga_select_team(pool, formation, constraints)
+        tci = summary.get("tci") or compute_tci(team, constraints, bench=summary.get("bench"))
+
+        summary["tci"] = tci
+        return _clean_struct({"team": team, "bench": summary.get("bench", []), "summary": summary})
+
+    elif tool_name == "suggest_transfers":
+        constraints = TeamConstraints(
+            formation_code=args.get("formation", "433_cdm"),
+            style=args.get("style", "balanced"),
+            budget_eur=args.get("budget_eur"),
+            gk_reserve_pct=args.get("gk_reserve_pct", 0.1),
+            max_age=args.get("max_age"),
+            min_pace=args.get("min_pace"),
+            min_physic=args.get("min_physic"),
+            min_stamina=args.get("min_stamina"),
+            min_passing=args.get("min_passing"),
+            min_overall=args.get("min_overall"),
+            prefer_playstyles=args.get("prefer_playstyles", []) or [],
+            mandatory_players=args.get("mandatory", []) or [],
+            blocked_players=args.get("blocked", []) or [],
+            bench_size=args.get("bench_size", 3) or 3,
+        )
+        current_team = args.get("current_team", []) or []
+        suggestions = suggest_transfers(current_team=current_team, constraints=constraints, max_suggestions=5)
+        return _clean_struct({"suggestions": suggestions})
 
     else:
         raise ValueError(f"Unknown tool: {tool_name}")

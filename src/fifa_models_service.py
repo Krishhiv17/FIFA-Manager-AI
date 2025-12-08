@@ -21,7 +21,7 @@ from Feature_Engineering.data_prep import (
 )
 
 # Prefer enriched dataset with playstyle; fall back to the original if missing.
-DATA_PATH = Path("./data/fifa23_with_playstyle.csv")
+DATA_PATH = Path("./data/fifa23_clean_with_playstyle.csv")
 FALLBACK_DATA_PATH = Path("./data/fifa23_clean.csv")
 MODELS_DIR = Path("./models")
 

@@ -271,7 +271,9 @@ def preprocess_df(path: Path = RAW_DATA_PATH) -> pd.DataFrame:
 
     # Drop rows with missing essential columns
     cols_needed = BASE_FEATURE_COLS + [TARGET_VALUE, TARGET_OVERALL, TARGET_POSITION]
-    df = df.dropna(subset=cols_needed).copy()
+    # Fill missing base features with 0 to retain GKs (who lack outfield stats)
+    df[BASE_FEATURE_COLS] = df[BASE_FEATURE_COLS].fillna(0)
+    df = df.dropna(subset=[TARGET_VALUE, TARGET_OVERALL, TARGET_POSITION]).copy()
 
     # Convert features to float
     df[BASE_FEATURE_COLS] = df[BASE_FEATURE_COLS].astype(float)
@@ -333,4 +335,3 @@ if __name__ == "__main__":
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df_clean.to_csv(out_path, index=False)
     print(f"\n[Saved] Cleaned dataset → {out_path.resolve()}")
-

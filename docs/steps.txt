@@ -7,7 +7,11 @@ Work plan (ongoing)
 Next steps to tackle:
 2) Define constraint schema + baseline optimizer loop (greedy/local search) using these formations. – DONE
    - Added src/team_optimizer.py with TeamConstraints, greedy selector, and role-weighted scoring.
-3) Playstyle-aware role fit scoring tied to slots.
-4) Team Competitiveness Index (positional fit, synergy, depth).
-5) Upgrade optimizer (GA/CP-SAT) once scoring pieces are ready.
-6) Agent integration and output formatting for teams/TCI.
+3) Playstyle-aware role fit scoring tied to slots. – DONE
+   - Enhanced team_optimizer scoring with role-to-playstyle prefs and bonuses.
+4) Team Competitiveness Index (positional fit, synergy, depth). – DONE
+   - Added TCI computation to team_optimizer (positional fit, role/playstyle fit, style compliance, line balance) with a 0–100 composite.
+5) Upgrade optimizer (GA/CP-SAT) once scoring pieces are ready. – PARTIAL (GA)
+   - Added simple genetic search option alongside greedy in team_optimizer.
+6) Agent integration and output formatting for teams/TCI and transfers – DONE
+   - Added build_team and suggest_transfers tools with optimizer/TCI wiring and JSON cleaning.
