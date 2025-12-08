@@ -1,14 +1,4 @@
-"""
-Baseline team optimizer scaffolding.
-
-Implements:
-- Constraint schema (budget, age/pace/physic/overall minima, playstyle prefs).
-- Greedy selector for 4-3-3 variants defined in `src/formations.py`.
-
-This is an intentionally simple first pass; later we can swap the search with
-GA/CP-SAT once scoring pieces are richer.
-"""
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import sys
@@ -105,6 +95,30 @@ ROLE_PLAYSTYLE_PREFS: Dict[str, List[str]] = {
     "GK Shot Stopper": ["GK Shot Stopper"],
     "GK Sweeper": ["GK Sweeper", "GK Distributor"],
 }
+
+
+def _materialize_constraints(constraints: TeamConstraints) -> TeamConstraints:
+    """
+    Bake style preset defaults into the constraints so that relaxations can modify
+    concrete numbers (instead of None).
+    """
+    preset = style_presets(constraints.style or "balanced")
+    return TeamConstraints(
+        formation_code=constraints.formation_code,
+        style=constraints.style,
+        budget_eur=constraints.budget_eur,
+        gk_reserve_pct=constraints.gk_reserve_pct,
+        max_age=constraints.max_age,
+        min_pace=constraints.min_pace if constraints.min_pace is not None else preset.get("min_pace"),
+        min_physic=constraints.min_physic if constraints.min_physic is not None else preset.get("min_physic"),
+        min_stamina=constraints.min_stamina if constraints.min_stamina is not None else preset.get("min_stamina"),
+        min_passing=constraints.min_passing if constraints.min_passing is not None else preset.get("min_passing"),
+        min_overall=constraints.min_overall if constraints.min_overall is not None else preset.get("min_overall"),
+        prefer_playstyles=list(constraints.prefer_playstyles),
+        mandatory_players=list(constraints.mandatory_players),
+        blocked_players=list(constraints.blocked_players),
+        bench_size=constraints.bench_size,
+    )
 
 
 def _clamp(v: float, lo: float = 0.0, hi: float = 100.0) -> float:
@@ -363,239 +377,6 @@ def _passes_filters(
 def _outfield_slots(formation: Formation) -> List[RoleSlot]:
     """Return formation slots excluding GK."""
     return [s for s in formation.slots if s.position_10 != "GK"]
-
-
-def greedy_select_team(
-    df: pd.DataFrame,
-    formation: Formation,
-    constraints: TeamConstraints,
-) -> Tuple[List[Dict], Dict]:
-    """
-    Greedy XI selection: for each slot, pick the highest scoring affordable player not yet used.
-    Returns (team_list, summary_stats).
-    """
-    used = set()
-    used_names = set()
-    # compute effective budget once
-    effective_budget = None
-    if constraints.budget_eur is not None:
-        try:
-            budget_val = float(constraints.budget_eur)
-            reserve = max(0.0, min(0.5, constraints.gk_reserve_pct))
-            effective_budget = budget_val * (1 - reserve)
-        except Exception:
-            effective_budget = None
-    team: List[Dict] = []
-    total_value = 0.0
-
-    slots = _outfield_slots(formation)
-
-    # Pre-assign mandatory players to matching outfield slots if possible
-    for m in constraints.mandatory_players:
-        row = _find_player_by_short_name(df, m)
-        if row is None:
-            continue
-        target_pos = str(row.get("position_10", "")).upper()
-        available_slots = [s for s in slots if s.id not in {t["slot"] for t in team}]
-        slot = next((s for s in available_slots if s.position_10 == target_pos), None)
-        if slot is None:
-            slot = next(
-                (s for s in available_slots if target_pos in _acceptable_positions(s.position_10)),
-                None,
-            )
-        if slot is None:
-            continue
-        # ignore budget for mandatory, but respect age/blocked/min overall
-        if constraints.blocked_players and str(row.get("short_name")) in constraints.blocked_players:
-            continue
-        if constraints.max_age is not None and row.get("age", 0) > constraints.max_age:
-            continue
-        if constraints.min_overall is not None and _stat(row, "overall") < constraints.min_overall:
-            continue
-        idx = row.name
-        used.add(idx)
-        used_names.add(str(row.get("short_name", "")).strip().lower())
-        total_value += _stat(row, "value_eur")
-        team.append(
-            {
-                "slot": slot.id,
-                "role_hint": slot.role_hint,
-                "position_10": slot.position_10,
-                "player": {
-                    "short_name": row.get("short_name"),
-                    "long_name": row.get("long_name"),
-                    "age": row.get("age"),
-                    "overall": row.get("overall"),
-                    "value_eur": row.get("value_eur"),
-                    "playstyle": row.get("playstyle"),
-                    "position_10": row.get("position_10"),
-                    "pace": row.get("pace"),
-                    "physic": row.get("physic"),
-                    "passing": row.get("passing"),
-                    "shooting": row.get("shooting"),
-                    "defending": row.get("defending"),
-                    "stamina": row.get("power_stamina"),
-                },
-                "score": 999.0,  # force-keep mandatory player
-            }
-        )
-
-    for slot in slots:
-        if any(t["slot"] == slot.id for t in team):
-            continue  # already filled by mandatory
-
-        slots_left = len(slots) - len(team) - 1
-        allowed_positions = _acceptable_positions(slot.position_10)
-
-        # Progressive relaxation if strict filters yield nothing (keep overall floor)
-        overall_floor = constraints.min_overall
-        relax_levels = [
-            {"min_pace": constraints.min_pace, "min_physic": constraints.min_physic, "min_overall": overall_floor},
-            {"min_pace": None, "min_physic": constraints.min_physic, "min_overall": overall_floor},
-            {"min_pace": None, "min_physic": None, "min_overall": overall_floor},
-        ]
-
-        candidates = []
-        for relax in relax_levels:
-            temp_constraints = TeamConstraints(
-                formation_code=constraints.formation_code,
-                style=constraints.style,
-                budget_eur=constraints.budget_eur,
-                gk_reserve_pct=constraints.gk_reserve_pct,
-                max_age=constraints.max_age,
-                min_pace=relax["min_pace"],
-                min_physic=relax["min_physic"],
-                min_stamina=constraints.min_stamina,
-                min_passing=constraints.min_passing,
-                min_overall=relax["min_overall"],
-                prefer_playstyles=constraints.prefer_playstyles,
-                mandatory_players=constraints.mandatory_players,
-                blocked_players=constraints.blocked_players,
-                bench_size=constraints.bench_size,
-            )
-            for idx, row in df.iterrows():
-                if idx in used:
-                    continue
-                short_name = str(row.get("short_name"))
-                short_name_norm = short_name.strip().lower()
-                if temp_constraints.blocked_players and short_name in temp_constraints.blocked_players:
-                    continue
-                if short_name_norm in used_names:
-                    continue
-                if _pos10(row) not in allowed_positions:
-                    continue
-                if not _passes_filters(
-                    row,
-                    temp_constraints,
-                    total_value,
-                    slots_left,
-                    slot_position=slot.position_10,
-                    effective_budget=effective_budget,
-                ):
-                    continue
-                score = score_player_for_slot(row, slot, temp_constraints.prefer_playstyles)
-                candidates.append((score, idx, row))
-            if candidates:
-                break
-
-        if not candidates:
-            # last-resort: pick a candidate ignoring budget but respecting position/overall/blocked
-            budget_relaxed = []
-            for idx, row in df.iterrows():
-                if idx in used:
-                    continue
-                name_norm = str(row.get("short_name", "")).strip().lower()
-                if constraints.blocked_players and str(row.get("short_name")) in constraints.blocked_players:
-                    continue
-                if name_norm in used_names:
-                    continue
-                if _pos10(row) not in allowed_positions:
-                    continue
-                if overall_floor is not None and _stat(row, "overall") < overall_floor:
-                    continue
-                # Use inverse value to prefer cheaper when budget-relaxed
-                score = _stat(row, "overall") - 0.0000001 * _stat(row, "value_eur")
-                budget_relaxed.append((score, idx, row))
-            candidates = budget_relaxed
-        if not candidates:
-            raise ValueError(f"No available candidates for slot {slot.id} under current constraints.")
-
-        # pick best-scoring candidate
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        best_score, best_idx, best_row = candidates[0]
-        # If adding this player blows the budget, skip and try next candidate
-        if effective_budget is not None and total_value + _stat(best_row, "value_eur") > effective_budget:
-            # try next best
-            placed = False
-            for cand_score, cand_idx, cand_row in candidates[1:]:
-                if effective_budget is not None and total_value + _stat(cand_row, "value_eur") > effective_budget:
-                    continue
-                best_score, best_idx, best_row = cand_score, cand_idx, cand_row
-                placed = True
-                break
-            if not placed:
-                raise ValueError(f"No affordable candidates for slot {slot.id} under budget constraints.")
-
-        used.add(best_idx)
-        used_names.add(str(best_row.get("short_name", "")).strip().lower())
-        total_value += _stat(best_row, "value_eur")
-
-        team.append(
-            {
-                "slot": slot.id,
-                "role_hint": slot.role_hint,
-                "position_10": slot.position_10,
-                "player": {
-                    "short_name": best_row.get("short_name"),
-                    "long_name": best_row.get("long_name"),
-                    "age": best_row.get("age"),
-                    "overall": best_row.get("overall"),
-                    "value_eur": best_row.get("value_eur"),
-                    "playstyle": best_row.get("playstyle"),
-                    "position_10": best_row.get("position_10"),
-                    "pace": best_row.get("pace"),
-                    "physic": best_row.get("physic"),
-                    "passing": best_row.get("passing"),
-                    "shooting": best_row.get("shooting"),
-                    "defending": best_row.get("defending"),
-                    "stamina": best_row.get("power_stamina"),
-                },
-                "score": best_score,
-            }
-        )
-
-    avg_overall = sum(_stat(item["player"], "overall") for item in team) / len(team)
-    starter_positions = {item["position_10"] for item in team}
-    effective_budget = None
-    if constraints.budget_eur is not None:
-        reserve = max(0.0, min(0.5, constraints.gk_reserve_pct))
-        effective_budget = constraints.budget_eur * (1 - reserve)
-    starter_value = total_value
-    bench, bench_value = select_bench(
-        df,
-        used,
-        constraints,
-        starter_positions=starter_positions,
-        starter_avg_overall=avg_overall,
-        current_total_value=starter_value,
-    )
-    # Enforce budget on bench: trim most expensive bench players until within budget
-    if effective_budget is not None and starter_value + bench_value > effective_budget:
-        bench_sorted = sorted(bench, key=lambda b: _stat(b["player"], "value_eur"), reverse=True)
-        while bench_sorted and starter_value + bench_value > effective_budget:
-            removed = bench_sorted.pop(0)
-            bench_value -= _stat(removed["player"], "value_eur")
-        bench = bench_sorted
-    total_value += bench_value
-
-    summary = {
-        "formation": formation.name,
-        "total_value_eur": total_value,
-        "avg_overall": avg_overall,
-        "slots": len(team),
-        "bench": bench,
-    }
-    return team, summary
 
 
 def _build_candidate_pool(df: pd.DataFrame, formation: Formation, constraints: TeamConstraints) -> Dict[str, List[int]]:
@@ -859,6 +640,74 @@ def ga_select_team(
     return team_with_gk, summary
 
 
+def _apply_relaxation_step(c: TeamConstraints, deltas: Dict[str, float]) -> Tuple[TeamConstraints, List[str]]:
+    """
+    Return a new constraints object with specified deltas applied (additive).
+    """
+    updated = replace(c)
+    notes = []
+
+    def bump(field: str, delta: float):
+        val = getattr(updated, field, None)
+        if val is None:
+            return
+        new_val = max(0.0, val + delta)
+        if new_val != val:
+            setattr(updated, field, new_val)
+            notes.append(f"{field} {val}->{new_val}")
+
+    for k, v in deltas.items():
+        bump(k, v)
+    return updated, notes
+
+
+RELAXATION_PLAN: List[Dict[str, float]] = [
+    {"max_age": 2},
+    {"min_overall": -1},
+    {"min_pace": -3, "min_physic": -3, "min_stamina": -3, "min_passing": -3},
+    {"max_age": 2, "min_overall": -1},
+]
+
+
+def build_team_with_relaxation(
+    df_raw: pd.DataFrame,
+    formation: Formation,
+    constraints: TeamConstraints,
+) -> Tuple[List[Dict], Dict]:
+    """
+    Run GA; if infeasible, progressively relax constraints and retry.
+    Returns team, summary; summary['relaxations'] lists applied steps.
+    """
+
+    def attempt(c: TeamConstraints) -> Tuple[List[Dict], Dict]:
+        pool = prefilter_pool(df_raw, c)
+        return ga_select_team(pool, formation, c)
+
+    # Try original constraints first
+    try:
+        team, summary = attempt(constraints)
+        summary["relaxations"] = []
+        return team, summary
+    except ValueError as first_err:
+        last_err = first_err
+
+    current = _materialize_constraints(constraints)
+    applied_notes: List[str] = []
+
+    for step in RELAXATION_PLAN:
+        current, notes = _apply_relaxation_step(current, step)
+        applied_notes.extend(notes)
+        try:
+            team, summary = attempt(current)
+            summary["relaxations"] = applied_notes
+            return team, summary
+        except ValueError as err:
+            last_err = err
+            continue
+
+    raise ValueError(f"Genetic search could not find a feasible team even after relaxation: {last_err}")
+
+
 def compute_tci(team: List[Dict], constraints: TeamConstraints, bench: Optional[List[Dict]] = None) -> Dict[str, float]:
     """
     Team Competitiveness Index: self-contained composite on 0-100 scale.
@@ -1059,9 +908,8 @@ if __name__ == "__main__":
     pool = load_player_pool()
     constraints = build_constraints_interactive()
     formation = get_formation(constraints.formation_code)
-    pool = prefilter_pool(pool, constraints)
 
-    team, summary = ga_select_team(pool, formation, constraints)
+    team, summary = build_team_with_relaxation(pool, formation, constraints)
     tci = summary.get("tci", compute_tci(team, constraints, bench=summary.get("bench")))
 
     print(f"\nFormation: {summary['formation']} | Style: {constraints.style} | Mode: genetic")
@@ -1075,6 +923,11 @@ if __name__ == "__main__":
             f"{item['slot']:4s} -> {p['short_name']} ({p.get('playstyle','')}) "
             f"| overall {p['overall']} | value €{p['value_eur']:,.0f}"
         )
+    relaxations = summary.get("relaxations") or []
+    if relaxations:
+        print("\nApplied graceful relaxation steps:")
+        for r in relaxations:
+            print(f"- {r}")
     if summary.get("bench"):
         print("\nBench:")
         for b in summary["bench"]:

@@ -18,8 +18,7 @@ from src.team_optimizer import (
     load_player_pool,
     TeamConstraints,
     get_formation,
-    greedy_select_team,
-    ga_select_team,
+    build_team_with_relaxation,
     compute_tci,
 )
 from src.transfer_suggester import suggest_transfers
@@ -100,11 +99,10 @@ TOOLS you can call:
        }
 
 3) build_team
-   - Description: build a team for a given formation/style/budget using local optimizer (greedy or genetic), returning XI, bench, and TCI.
+   - Description: build a team for a given formation/style/budget using the genetic optimizer (with graceful relaxation), returning XI, bench, and TCI.
    - Args (JSON): {
        "formation": "433_cdm"|"433_cam",
        "style": "balanced"|"counter"|"high_press"|"possession",
-       "mode": "genetic"|"greedy",
        "budget_eur": <number|null>,
        "max_age": <number|null>,
        "min_overall": <number|null>,
@@ -361,8 +359,8 @@ def run_tool(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             bench_size=args.get("bench_size", 3) or 3,
         )
         formation = get_formation(constraints.formation_code)
-        # Genetic only
-        team, summary = ga_select_team(pool, formation, constraints)
+        # Genetic only with graceful relaxation fallback
+        team, summary = build_team_with_relaxation(pool, formation, constraints)
         tci = summary.get("tci") or compute_tci(team, constraints, bench=summary.get("bench"))
 
         summary["tci"] = tci
