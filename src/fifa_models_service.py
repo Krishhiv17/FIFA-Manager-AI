@@ -7,6 +7,7 @@ import pandas as pd
 import joblib
 import re
 from difflib import SequenceMatcher
+import warnings
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -66,7 +67,13 @@ def _load_value_model():
     global _value_art
     if _value_art is None:
         _assert_not_lfs_pointer(MODELS_DIR / "value_xgb.joblib")
-        _value_art = joblib.load(MODELS_DIR / "value_xgb.joblib")
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=".*If you are loading a serialized model.*",
+                category=UserWarning,
+            )
+            _value_art = joblib.load(MODELS_DIR / "value_xgb.joblib")
     return _value_art
 
 
@@ -74,7 +81,13 @@ def _load_overall_model():
     global _overall_art
     if _overall_art is None:
         _assert_not_lfs_pointer(MODELS_DIR / "overall_xgb.joblib")
-        _overall_art = joblib.load(MODELS_DIR / "overall_xgb.joblib")
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=".*If you are loading a serialized model.*",
+                category=UserWarning,
+            )
+            _overall_art = joblib.load(MODELS_DIR / "overall_xgb.joblib")
     return _overall_art
 
 
@@ -82,7 +95,13 @@ def _load_position_model():
     global _position_art
     if _position_art is None:
         _assert_not_lfs_pointer(MODELS_DIR / "position_xgb.joblib")
-        _position_art = joblib.load(MODELS_DIR / "position_xgb.joblib")
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=".*If you are loading a serialized model.*",
+                category=UserWarning,
+            )
+            _position_art = joblib.load(MODELS_DIR / "position_xgb.joblib")
     return _position_art
 
 

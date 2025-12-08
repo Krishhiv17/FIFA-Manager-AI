@@ -52,6 +52,30 @@ def normalize_current_team(raw_team: List[Dict]) -> List[CurrentPlayer]:
     return normalized
 
 
+def _acceptable_positions(slot_pos: str) -> List[str]:
+    """Mirror the slot-compatibility used in the optimizer (simple fallbacks)."""
+    slot_pos = slot_pos.upper()
+    if slot_pos == "RB":
+        return ["RB", "LB"]
+    if slot_pos == "LB":
+        return ["LB", "RB"]
+    if slot_pos == "RW":
+        return ["RW", "LW", "ST"]
+    if slot_pos == "LW":
+        return ["LW", "RW", "ST"]
+    if slot_pos == "CAM":
+        return ["CAM", "CM", "CDM"]
+    if slot_pos == "CDM":
+        return ["CDM", "CM"]
+    if slot_pos == "CM":
+        return ["CM", "CDM", "CAM"]
+    if slot_pos == "CB":
+        return ["CB", "LB", "RB"]
+    if slot_pos == "ST":
+        return ["ST", "LW", "RW"]
+    return [slot_pos]
+
+
 def suggest_transfers(
     current_team: List[Dict],
     constraints: TeamConstraints,
@@ -80,15 +104,21 @@ def suggest_transfers(
     eff_min_pace = min_pace if min_pace is not None else preset.get("min_pace")
     eff_min_physic = min_physic if min_physic is not None else preset.get("min_physic")
     eff_min_passing = constraints.min_passing if constraints.min_passing is not None else preset.get("min_passing")
-    current_names = {p.short_name for p in norm_team}
+    # normalize current names for duplicate checks
+    current_names = {p.short_name.strip().lower() for p in norm_team}
+
+    used_currents = set()
 
     for slot in slots:
         if target_positions and slot.position_10 not in target_positions:
             continue
-        # Find current player for this slot by position or id
-        current = next((p for p in norm_team if p.position_10 == slot.position_10), None)
+        # Find current player for this slot by exact position match, avoid reusing same current twice
+        allowed_positions = _acceptable_positions(slot.position_10)
+        current = next((p for p in norm_team if p.position_10 == slot.position_10 and p.short_name not in used_currents), None)
         if replace_players and current and current.short_name not in replace_players:
             continue
+        if current:
+            used_currents.add(current.short_name)
 
         # Build a score threshold: if current exists, we try to beat their score by a margin
         current_score = None
@@ -102,9 +132,10 @@ def suggest_transfers(
         # Score pool candidates for this slot (position match only)
         scored = []
         for _, row in pool.iterrows():
-            if str(row.get("short_name")) in current_names:
+            name_norm = str(row.get("short_name", "")).strip().lower()
+            if name_norm in current_names:
                 continue  # don't suggest players already in the squad
-            if str(row.get("position_10", "")).upper() != slot.position_10:
+            if str(row.get("position_10", "")).upper() not in allowed_positions:
                 continue
             if max_age is not None and row.get("age", 0) > max_age:
                 continue
@@ -151,6 +182,113 @@ def suggest_transfers(
     # Sort suggestions by score gain descending
     suggestions.sort(key=lambda s: s["score_gain"], reverse=True)
     return suggestions[:max_suggestions]
+
+
+def suggest_replacements_for_player(
+    current_player: Dict[str, str],
+    constraints: TeamConstraints,
+    desired_playstyles: Optional[List[str]] = None,
+    max_suggestions: int = 3,
+) -> List[Dict]:
+    """
+    Suggest up to max_suggestions replacements for a single player, based on position,
+    style constraints, and desired playstyles. Uses per-player budget cap if provided.
+    """
+    pool = load_player_pool()
+    preset = style_presets(constraints.style or "balanced")
+    prefer_styles = desired_playstyles or []
+    if not prefer_styles:
+        prefer_styles = preset.get("prefer_playstyles", [])
+
+    # Infer position if not provided
+    target_name = str(current_player.get("short_name", "")).strip()
+    target_pos = str(current_player.get("position_10", "")).strip().upper()
+    if not target_pos:
+        row = pool[pool["short_name"].str.lower() == target_name.lower()]
+        if not row.empty:
+            target_pos = str(row.iloc[0].get("position_10", "")).upper()
+    if not target_pos:
+        return []
+
+    allowed_positions = _acceptable_positions(target_pos)
+
+    eff_min_overall = constraints.min_overall if constraints.min_overall is not None else preset.get("min_overall")
+    eff_min_pace = constraints.min_pace if constraints.min_pace is not None else preset.get("min_pace")
+    eff_min_physic = constraints.min_physic if constraints.min_physic is not None else preset.get("min_physic")
+    eff_min_passing = constraints.min_passing if constraints.min_passing is not None else preset.get("min_passing")
+
+    # Budget per player (use provided budget_eur as a hard cap for this replacement)
+    per_player_cap = float(constraints.budget_eur) if constraints.budget_eur is not None else None
+
+    def role_hint_for_pos(pos: str) -> str:
+        pos = pos.upper()
+        if pos in {"RB", "LB"}:
+            return "Attacking Wingback"
+        if pos == "CB":
+            return "Stopper CB"
+        if pos == "CDM":
+            return "Holding Playmaker"
+        if pos == "CM":
+            return "Box-to-Box Mid"
+        if pos == "CAM":
+            return "Creative Playmaker"
+        if pos in {"RW", "LW"}:
+            return "Pace Winger"
+        if pos == "ST":
+            return "Poacher"
+        return pos
+
+    dummy_slot = type(
+        "Slot",
+        (),
+        {"position_10": target_pos, "role_hint": role_hint_for_pos(target_pos)},
+    )()
+
+    scored = []
+    current_norm = target_name.lower()
+    for _, row in pool.iterrows():
+        name_norm = str(row.get("short_name", "")).strip().lower()
+        if name_norm == current_norm:
+            continue
+        pos = str(row.get("position_10", "")).upper()
+        if pos not in allowed_positions:
+            continue
+        if constraints.max_age is not None and row.get("age", 0) > constraints.max_age:
+            continue
+        if eff_min_overall is not None and row.get("overall", 0) < eff_min_overall:
+            continue
+        if eff_min_pace is not None and row.get("pace", 0) < eff_min_pace:
+            continue
+        if eff_min_physic is not None and row.get("physic", 0) < eff_min_physic:
+            continue
+        if eff_min_passing is not None and row.get("passing", 0) < eff_min_passing:
+            continue
+        if per_player_cap is not None and row.get("value_eur", 0) > per_player_cap:
+            continue
+        score = score_player_for_slot(row, dummy_slot, prefer_styles)
+        scored.append((score, row))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    suggestions = []
+    for score, row in scored[:max_suggestions]:
+        suggestions.append(
+            {
+                "current_player": target_name,
+                "slot": target_pos,
+                "candidate": {
+                    "short_name": row["short_name"],
+                    "long_name": row["long_name"],
+                    "position_10": row["position_10"],
+                    "playstyle": row.get("playstyle"),
+                    "overall": row["overall"],
+                    "value_eur": row["value_eur"],
+                    "pace": row["pace"],
+                    "physic": row["physic"],
+                },
+                "score": score,
+            }
+        )
+    return suggestions
 
 
 if __name__ == "__main__":

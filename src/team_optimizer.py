@@ -176,13 +176,13 @@ def _acceptable_positions(slot_pos: str) -> List[str]:
     if slot_pos == "LW":
         return ["LW", "RW", "ST"]
     if slot_pos == "CAM":
-        return ["CAM", "CM", "CDM"]
+        return ["CAM", "CM"]
     if slot_pos == "CDM":
         return ["CDM", "CM"]
     if slot_pos == "CM":
         return ["CM", "CDM", "CAM"]
     if slot_pos == "CB":
-        return ["CB", "LB", "RB"]
+        return ["CB"]
     if slot_pos == "ST":
         return ["ST", "LW", "RW"]
     return [slot_pos]
@@ -204,6 +204,7 @@ def prefilter_pool(df: pd.DataFrame, constraints: TeamConstraints) -> pd.DataFra
     Global prefilter to shrink search space based on style/constraints.
     Applies age and style-based floors before slot-specific selection.
     """
+    mandatory_set = {m.strip().lower() for m in constraints.mandatory_players} if constraints.mandatory_players else set()
     preset = style_presets(constraints.style or "balanced")
     eff_min_overall = constraints.min_overall if constraints.min_overall is not None else preset.get("min_overall")
     eff_min_pace = constraints.min_pace if constraints.min_pace is not None else preset.get("min_pace")
@@ -215,17 +216,37 @@ def prefilter_pool(df: pd.DataFrame, constraints: TeamConstraints) -> pd.DataFra
 
     mask = pd.Series([True] * len(df))
     if constraints.max_age is not None:
-        mask &= df["age"] <= constraints.max_age
+        age_ok = df["age"] <= constraints.max_age
+        if mandatory_set:
+            mandatory_mask = df["short_name"].astype(str).str.lower().isin(mandatory_set)
+            age_ok = age_ok | mandatory_mask  # keep mandatory even if over age
+        mask &= age_ok
     # Apply style floors only to non-GK
     nongk_mask = ~is_gk
     if eff_min_overall is not None:
-        mask &= (~nongk_mask) | (df["overall"] >= eff_min_overall)
+        ok = (df["overall"] >= eff_min_overall)
+        if mandatory_set:
+            mandatory_mask = df["short_name"].astype(str).str.lower().isin(mandatory_set)
+            ok = ok | mandatory_mask
+        mask &= (~nongk_mask) | ok
     if eff_min_pace is not None:
-        mask &= (~nongk_mask) | (df["pace"] >= eff_min_pace)
+        ok = (df["pace"] >= eff_min_pace)
+        if mandatory_set:
+            mandatory_mask = df["short_name"].astype(str).str.lower().isin(mandatory_set)
+            ok = ok | mandatory_mask
+        mask &= (~nongk_mask) | ok
     if eff_min_physic is not None:
-        mask &= (~nongk_mask) | (df["physic"] >= eff_min_physic)
+        ok = (df["physic"] >= eff_min_physic)
+        if mandatory_set:
+            mandatory_mask = df["short_name"].astype(str).str.lower().isin(mandatory_set)
+            ok = ok | mandatory_mask
+        mask &= (~nongk_mask) | ok
     if eff_min_passing is not None:
-        mask &= (~nongk_mask) | (df["passing"] >= eff_min_passing)
+        ok = (df["passing"] >= eff_min_passing)
+        if mandatory_set:
+            mandatory_mask = df["short_name"].astype(str).str.lower().isin(mandatory_set)
+            ok = ok | mandatory_mask
+        mask &= (~nongk_mask) | ok
 
     filtered = df[mask].copy()
 
@@ -390,6 +411,11 @@ def _build_candidate_pool(df: pd.DataFrame, formation: Formation, constraints: T
             # enforce position match for pools with fallback
             if _pos10(row) not in allowed_positions:
                 continue
+            # Avoid using fullbacks/wingbacks in winger slots
+            if slot.position_10 in {"LW", "RW"}:
+                ps = str(row.get("playstyle", "")).lower()
+                if "wingback" in ps or "fullback" in ps:
+                    continue
             # Relax budget in pool; we'll handle budget in fitness.
             if not _passes_filters(row, constraints, current_value=0.0, slots_left=0, slot_position=slot.position_10):
                 continue
@@ -513,6 +539,9 @@ def _fitness_team(team: List[Dict], constraints: TeamConstraints, df: Optional[p
     bench = []
     bench_value = 0.0
     starter_positions = {item["position_10"] for item in team}
+    # Hard reject duplicate indices early
+    if used_indices is not None and len(used_indices) < len(team):
+        return -1e9, {"tci": {"tci": 0.0}, "total_value": 0.0, "bench": [], "bench_value": 0.0}
     if df is not None and used_indices is not None and constraints.bench_size > 0:
         bench, bench_value = select_bench(df, used_indices, constraints, starter_positions=starter_positions)
 
@@ -534,8 +563,8 @@ def _fitness_team(team: List[Dict], constraints: TeamConstraints, df: Optional[p
 
     # Penalty for duplicate players
     names = [item["player"]["short_name"] for item in team]
-    dup_penalty = (len(names) - len(set(names))) * 30.0
-    fitness -= dup_penalty
+    if len(names) != len(set(names)):
+        return -1e9, {"tci": tci, "total_value": total_value, "bench": bench, "bench_value": bench_value}
 
     # Penalty for missing mandatory players
     if constraints.mandatory_players:
@@ -558,21 +587,51 @@ def ga_select_team(
     """
     effective_budget = _compute_effective_budget(constraints)
     pools = _build_candidate_pool(df, formation, constraints)
+
+    # Force mandatory players into specific slots if possible
+    mandatory_map: Dict[str, int] = {}
+    if constraints.mandatory_players:
+        for name in constraints.mandatory_players:
+            row = _find_player_by_short_name(df, name)
+            if row is None:
+                continue
+            pos = _pos10(row)
+            allowed_slots = [s for s in _outfield_slots(formation) if pos in _acceptable_positions(s.position_10)]
+            if not allowed_slots:
+                continue
+            # pick first free slot, otherwise overwrite first
+            slot = next((s for s in allowed_slots if s.id not in mandatory_map), allowed_slots[0])
+            mandatory_map[slot.id] = row.name
+            if row.name not in pools.get(slot.id, []):
+                pools.setdefault(slot.id, []).append(row.name)
+
     if any(len(v) == 0 for v in pools.values()):
         raise ValueError("No candidates for at least one slot under given constraints.")
 
     def random_team_indices() -> Dict[str, int]:
-        return {slot.id: random.choice(pools[slot.id]) for slot in _outfield_slots(formation)}
+        picks = {}
+        for slot in _outfield_slots(formation):
+            if slot.id in mandatory_map:
+                picks[slot.id] = mandatory_map[slot.id]
+            else:
+                picks[slot.id] = random.choice(pools[slot.id])
+        return picks
 
     def crossover(a: Dict[str, int], b: Dict[str, int]) -> Dict[str, int]:
         child = {}
         for i, slot in enumerate(_outfield_slots(formation)):
-            child[slot.id] = a[slot.id] if i % 2 == 0 else b[slot.id]
+            if slot.id in mandatory_map:
+                child[slot.id] = mandatory_map[slot.id]
+            else:
+                child[slot.id] = a[slot.id] if i % 2 == 0 else b[slot.id]
         return child
 
     def mutate(ind: Dict[str, int]) -> Dict[str, int]:
         mutant = dict(ind)
         for slot in _outfield_slots(formation):
+            if slot.id in mandatory_map:
+                mutant[slot.id] = mandatory_map[slot.id]
+                continue
             if random.random() < mutation_prob:
                 mutant[slot.id] = random.choice(pools[slot.id])
         return mutant
@@ -679,9 +738,9 @@ def build_team_with_relaxation(
     Returns team, summary; summary['relaxations'] lists applied steps.
     """
 
-    def attempt(c: TeamConstraints) -> Tuple[List[Dict], Dict]:
+    def attempt(c: TeamConstraints, generations: int = 12, pop_size: int = 24) -> Tuple[List[Dict], Dict]:
         pool = prefilter_pool(df_raw, c)
-        return ga_select_team(pool, formation, c)
+        return ga_select_team(pool, formation, c, generations=generations, pop_size=pop_size)
 
     # Try original constraints first
     try:
@@ -690,6 +749,14 @@ def build_team_with_relaxation(
         return team, summary
     except ValueError as first_err:
         last_err = first_err
+
+    # Second attempt with a bit more search budget before relaxing
+    try:
+        team, summary = attempt(constraints, generations=18, pop_size=32)
+        summary["relaxations"] = []
+        return team, summary
+    except ValueError as second_err:
+        last_err = second_err
 
     current = _materialize_constraints(constraints)
     applied_notes: List[str] = []
