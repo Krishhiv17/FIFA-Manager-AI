@@ -9,6 +9,7 @@ from src.team_optimizer import (
     compute_tci,
 )
 from src.transfer_suggester import suggest_replacements_for_player
+from src.agent import agent_chat
 from src.fifa_models_service import predict_all_for_player, find_players_by_name
 
 
@@ -98,10 +99,16 @@ def _player_names(pool) -> List[str]:
 def _playstyle_options(pool) -> List[str]:
     return sorted([p for p in pool["playstyle"].dropna().unique().tolist() if p])
 
+def _llm_reason(prompt: str) -> str:
+    try:
+        return agent_chat(prompt)
+    except Exception as e:
+        return f"(LLM reasoning unavailable: {e})"
+
 
 # ----------------- Sidebar Controls ----------------- #
 st.sidebar.title("Controls")
-section = st.sidebar.radio("Mode", ["Build Team", "Player Replace", "Compare Players", "Player Info"])
+section = st.sidebar.radio("Mode", ["Build Team", "Player Replace", "Compare Players", "Player Info", "Agent Chat"])
 
 pool = _load_pool()
 all_player_names = _player_names(pool)
@@ -188,6 +195,24 @@ if section == "Build Team":
             relax = summary.get("relaxations") or []
             if relax:
                 st.info("Relaxations applied: " + "; ".join(relax))
+            # LLM rationale
+            rendered_team = "\n".join(
+                [f"{item['slot']} -> {item['player']['short_name']} ({item['player'].get('playstyle','')}) overall {item['player']['overall']}"
+                 for item in team]
+            )
+            bench_txt = "\n".join(
+                [f"{b['slot']} -> {b['player']['short_name']} ({b['player'].get('playstyle','')}) overall {b['player']['overall']}"
+                 for b in bench]
+            ) if bench else "None"
+            llm_prompt = (
+                f"As a football analyst, justify why this team is strong for a {constraints.style} style in {formation.name}. "
+                f"Use the TCI breakdown to explain (positional {tci['positional_fit']:.1f}, role {tci['role_playstyle_fit']:.1f}, "
+                f"style {tci['style_compliance']:.1f}, line {tci['line_balance']:.1f}, depth {tci['depth']:.1f}) and why they are high. "
+                f"Call out standout strengths and any weak spots in 3-4 sentences. "
+                f"Total value {_fmt_val(summary['total_value_eur'])}, TCI {tci['tci']:.1f}. "
+                f"Starters:\n{rendered_team}\nBench:\n{bench_txt}"
+            )
+            st.success(_llm_reason(llm_prompt))
         except Exception as e:
             st.error(f"Failed to build team: {e}")
 
@@ -292,7 +317,12 @@ elif section == "Compare Players":
                         f"Role fit differs: {player_a['short_name']} profiles as {preds_a['position']['position_pred']}, "
                         f"while {player_b['short_name']} is best as {preds_b['position']['position_pred']}."
                     )
-                st.info(" ".join(reason_lines))
+                llm_prompt = (
+                    f"Given these two players, tell me who is better and why, using their predicted stats and roles.\n"
+                    f"{desc_a}\n{desc_b}\n"
+                    f"Value delta {_fmt_val(val_a-val_b)}, overall delta {ov_a-ov_b:.1f}."
+                )
+                st.info(_llm_reason(llm_prompt))
         except Exception as e:
             st.error(f"Comparison failed: {e}")
 
@@ -322,5 +352,28 @@ elif section == "Player Info":
                 """,
                 unsafe_allow_html=True,
             )
+            llm_prompt = (
+                f"Explain why this player has the predicted value and overall based on their attributes and playstyle.\n"
+                f"{player['long_name']} ({player['short_name']}), age {player.get('age','?')}, playstyle {player.get('playstyle','Unspecified')}, "
+                f"value {_fmt_val(preds['value']['value_pred'])}, overall {preds['overall']['overall_pred']:.1f}, "
+                f"position {preds['position']['position_pred']}, strengths {strength_txt}."
+            )
+            st.info(_llm_reason(llm_prompt))
         except Exception as e:
             st.error(f"Lookup failed: {e}")
+
+elif section == "Agent Chat":
+    st.header("Agent Chat (LLM-powered)")
+    user_prompt = st.text_area(
+        "Ask anything (team builds, player comparisons, transfers). The agent will use local tools.",
+        height=140,
+    )
+    if st.button("Run Agent", type="primary"):
+        if not user_prompt.strip():
+            st.warning("Please enter a prompt.")
+        else:
+            try:
+                answer = agent_chat(user_prompt.strip())
+                st.markdown(f"**Agent response:**\n\n{answer}")
+            except Exception as e:
+                st.error(f"Agent error: {e}")
